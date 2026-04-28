@@ -29,6 +29,7 @@ fi
 
 cat > "$ENV_FILE" <<EOF
 PYTHONUNBUFFERED=1
+TZ=Asia/Shanghai
 XMU_ROLLCALL_CONFIG_DIR=$DATA_DIR
 XMU_WECHAT_BOT_CRED_PATH=$DATA_DIR/wechatbot-credentials.json
 EOF

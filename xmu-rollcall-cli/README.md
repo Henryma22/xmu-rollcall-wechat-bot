@@ -34,6 +34,7 @@ python -m xmu_rollcall.wechat_bot
 - `/switch 账号ID`
 - `/accounts`
 - `/answer`
+- `/cron add 4 8:00`
 - `/refresh`
 - `/cancel`
 - `/help`

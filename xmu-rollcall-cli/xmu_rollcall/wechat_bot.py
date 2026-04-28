@@ -3,19 +3,30 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import shlex
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Union
+from zoneinfo import ZoneInfo
 
 from .config import CONFIG_DIR, ensure_config_dir
 from .rollcall_service import AnswerBatchResult, AnswerOutcome, RollcallService
 from .utils import save_session
 from .wechat_storage import (
     add_or_update_user_account,
+    add_user_cron_schedule,
     build_user_session_cache_key,
+    clear_user_cron_schedules,
+    delete_user_cron_schedule,
     get_current_user_account,
+    get_user_cron_schedules,
     get_user_accounts,
+    list_user_cron_jobs,
+    load_all_user_context_tokens,
+    mark_user_cron_triggered,
+    save_user_context_token,
     set_current_user_account,
 )
 
@@ -23,6 +34,11 @@ MAX_LINES_PER_MESSAGE = 12
 MAX_CHARS_PER_MESSAGE = 380
 SUMMARY_ROWS_PER_MESSAGE = 4
 DETAIL_BLOCKS_PER_MESSAGE = 2
+CRON_ROWS_PER_MESSAGE = 4
+CRON_POLL_INTERVAL_SECONDS = 20
+CRON_GRACE_SECONDS = 300
+CHINA_TZ = ZoneInfo("Asia/Shanghai")
+CRON_TIME_PATTERN = re.compile(r"^(\d{1,2}):(\d{2})$")
 
 ReplyPayload = Union[str, List[str], None]
 
@@ -53,10 +69,108 @@ def _account_id_text(account: Optional[dict]) -> str:
     return f"`{account.get('id')}`"
 
 
+def _cron_id_text(schedule: Optional[dict]) -> str:
+    if not schedule:
+        return "-"
+    return f"`{int(schedule.get('id', 0))}`"
+
+
 def _compact_time(value: str) -> str:
     if len(value) >= 16:
         return value[5:16]
     return value
+
+
+def _china_now() -> datetime:
+    return datetime.now(CHINA_TZ)
+
+
+def _to_china_time(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=CHINA_TZ)
+    return value.astimezone(CHINA_TZ)
+
+
+def _format_datetime(value: datetime) -> str:
+    return _to_china_time(value).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _weekday_text(weekday: int) -> str:
+    labels = {
+        1: "周一",
+        2: "周二",
+        3: "周三",
+        4: "周四",
+        5: "周五",
+        6: "周六",
+        7: "周日",
+    }
+    return labels.get(int(weekday), f"周{weekday}")
+
+
+def _format_cron_label(schedule: Optional[dict]) -> str:
+    if not schedule:
+        return "未设置"
+    weekday = int(schedule.get("weekday", 0))
+    hour = int(schedule.get("hour", 0))
+    minute = int(schedule.get("minute", 0))
+    return f"{_weekday_text(weekday)} {hour:02d}:{minute:02d}"
+
+
+def _format_cron_table(schedules: Sequence[dict]) -> str:
+    if not schedules:
+        return _build_table(
+            ["ID", "计划", "状态"],
+            [["-", "未设置", "发送 `/cron 4 8:00`"]],
+        )
+
+    rows = []
+    for schedule in schedules:
+        rows.append([
+            _cron_id_text(schedule),
+            _format_cron_label(schedule),
+            "已启用",
+        ])
+    return _build_table(["ID", "计划", "状态"], rows)
+
+
+def _parse_cron_time(value: str) -> Optional[tuple[int, int]]:
+    match = CRON_TIME_PATTERN.fullmatch(value.strip())
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
+
+
+def _resolve_due_cron_slot(now: datetime, schedule: Optional[dict]) -> Optional[str]:
+    if not isinstance(schedule, dict):
+        return None
+
+    try:
+        weekday = int(schedule.get("weekday", 0))
+        hour = int(schedule.get("hour", 0))
+        minute = int(schedule.get("minute", 0))
+    except (TypeError, ValueError):
+        return None
+
+    if weekday != now.isoweekday():
+        return None
+
+    try:
+        scheduled_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    except ValueError:
+        return None
+    delta_seconds = (now - scheduled_at).total_seconds()
+    if delta_seconds < 0 or delta_seconds > CRON_GRACE_SECONDS:
+        return None
+
+    slot_key = scheduled_at.strftime("%Y-%m-%dT%H:%M")
+    if schedule.get("last_triggered_key") == slot_key:
+        return None
+    return slot_key
 
 
 def _build_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
@@ -153,12 +267,17 @@ def _format_help_markdown() -> str:
                     ["`/switch 1`", "切换账号"],
                     ["`/accounts`", "查看账号 ID"],
                     ["`/answer`", "查询并应答"],
+                    ["`/cron add 4 8:00`", "新增定时"],
+                    ["`/cron del 2`", "删除任务"],
+                    ["`/cron off`", "清空全部"],
                     ["`/refresh`", "清理登录缓存"],
                     ["`/cancel`", "取消 `/conf`"],
                 ],
             ),
             "",
             "> `/conf` 后依次发送学号、密码。",
+            "> `/cron` 的星期使用 1-7，分别代表周一到周日。",
+            "> 简写 `/cron 4 8:00` 等同于新增一条任务。",
         ]
     )
 
@@ -320,6 +439,104 @@ def _format_no_rollcall_markdown(account: dict, queried_at: str) -> str:
     )
 
 
+def _format_cron_status_messages(schedules: Sequence[dict]) -> List[str]:
+    if not schedules:
+        return [
+            "\n".join(
+                [
+                    "# 定时签到",
+                    "",
+                    _format_cron_table([]),
+                    "",
+                    "> 用 `/cron add 4 8:00` 或 `/cron 4 8:00` 新增。",
+                    "> 时间支持 `8:00` 和 `08:00`。",
+                ]
+            )
+        ]
+
+    messages = [
+        "\n".join(
+            [
+                "# 定时签到",
+                "",
+                _build_table(
+                    ["数量", "时区"],
+                    [[f"`{len(schedules)}`", "UTC+8"]],
+                ),
+                "",
+                "> 新增：`/cron add 4 8:00`  删除：`/cron del 2`",
+            ]
+        )
+    ]
+    for chunk in _chunked(list(schedules), CRON_ROWS_PER_MESSAGE):
+        messages.append(
+            "\n".join(
+                [
+                    "# 列表",
+                    "",
+                    _format_cron_table(chunk),
+                ]
+            )
+        )
+    return messages
+
+
+def _format_cron_set_markdown(schedule: dict, created: bool) -> str:
+    title = "# 定时签到已新增" if created else "# 定时签到已存在"
+    status = "已添加" if created else "未重复添加"
+    return "\n".join(
+        [
+            title,
+            "",
+            _build_table(
+                ["ID", "计划", "结果"],
+                [[_cron_id_text(schedule), _format_cron_label(schedule), status]],
+            ),
+        ]
+    )
+
+
+def _format_cron_deleted_markdown(schedule: dict) -> str:
+    return "\n".join(
+        [
+            "# 定时签到已删除",
+            "",
+            _build_table(
+                ["ID", "计划"],
+                [[_cron_id_text(schedule), _format_cron_label(schedule)]],
+            ),
+        ]
+    )
+
+
+def _format_cron_cleared_markdown(cleared_count: int) -> str:
+    status = f"已清空 `{cleared_count}` 条任务。" if cleared_count else "当前没有已设置的定时任务。"
+    return "\n".join(
+        [
+            "# 定时签到",
+            "",
+            f"- {status}",
+        ]
+    )
+
+
+def _format_cron_run_markdown(schedule: dict, executed_at: datetime) -> str:
+    return "\n".join(
+        [
+            "# 定时签到执行",
+            "",
+            _build_table(
+                ["ID", "计划", "执行时间"],
+                [[
+                    _cron_id_text(schedule),
+                    _format_cron_label(schedule),
+                    f"`{_compact_time(_format_datetime(executed_at))}`",
+                ]],
+            ),
+        ]
+    )
+
+
 def _detail_text(outcome: AnswerOutcome) -> str:
     if outcome.number_code:
         return f"码 `{_escape_markdown(outcome.number_code)}`"
@@ -334,7 +551,7 @@ def _detail_text(outcome: AnswerOutcome) -> str:
 
 def _format_answer_messages(batch_result: AnswerBatchResult) -> List[str]:
     account = batch_result.account
-    queried_at = batch_result.queried_at.strftime("%Y-%m-%d %H:%M:%S")
+    queried_at = _format_datetime(batch_result.queried_at)
     messages: List[str] = [
         "\n".join(
             [
@@ -422,11 +639,40 @@ class XMUWeChatBotApp:
         self.bot = bot
         self.command_lock = asyncio.Lock()
         self.pending_configs: Dict[str, PendingConfigState] = {}
+        self.cron_task: Optional[asyncio.Task[None]] = None
+
+    def restore_context_tokens(self) -> None:
+        context_tokens = getattr(self.bot, "_context_tokens", None)
+        if not isinstance(context_tokens, dict):
+            return
+        context_tokens.update(load_all_user_context_tokens())
+
+    async def start_background_tasks(self) -> None:
+        self.restore_context_tokens()
+        if self.cron_task is None:
+            self.cron_task = asyncio.create_task(self._cron_loop())
+
+    async def stop_background_tasks(self) -> None:
+        if self.cron_task is None:
+            return
+        self.cron_task.cancel()
+        try:
+            await self.cron_task
+        except asyncio.CancelledError:
+            pass
+        self.cron_task = None
 
     async def handle_message(self, msg: Any) -> None:
         text = (getattr(msg, "text", "") or "").strip()
         if not text:
             return
+
+        context_token = getattr(msg, "_context_token", "") or ""
+        if context_token:
+            await asyncio.to_thread(save_user_context_token, msg.user_id, context_token)
+            context_tokens = getattr(self.bot, "_context_tokens", None)
+            if isinstance(context_tokens, dict):
+                context_tokens[msg.user_id] = context_token
 
         async with self.command_lock:
             try:
@@ -439,12 +685,19 @@ class XMUWeChatBotApp:
             except Exception as exc:
                 reply_payload = _format_error_markdown("执行失败", str(exc))
 
-            await self._send_messages(msg, reply_payload)
+            await self._reply_messages(msg, reply_payload)
 
-    async def _send_messages(self, msg: Any, payload: ReplyPayload) -> None:
+    async def _reply_messages(self, msg: Any, payload: ReplyPayload) -> None:
         messages = _normalize_messages(payload)
         for index, message in enumerate(messages):
             await self.bot.reply(msg, message)
+            if index < len(messages) - 1:
+                await asyncio.sleep(0.2)
+
+    async def _send_user_messages(self, user_id: str, payload: ReplyPayload) -> None:
+        messages = _normalize_messages(payload)
+        for index, message in enumerate(messages):
+            await self.bot.send(user_id, message)
             if index < len(messages) - 1:
                 await asyncio.sleep(0.2)
 
@@ -477,6 +730,8 @@ class XMUWeChatBotApp:
             return await self._handle_switch(msg.user_id, parts)
         if command == "/answer":
             return await self._handle_answer(msg.user_id)
+        if command == "/cron":
+            return await self._handle_cron(msg.user_id, parts)
         if command == "/refresh":
             return await self._handle_refresh(msg.user_id)
         if command == "/cancel":
@@ -573,10 +828,66 @@ class XMUWeChatBotApp:
         cache_key = build_user_session_cache_key(user_id, int(account["id"]))
         service = RollcallService(account, session_cache_key=cache_key)
         batch_result = await asyncio.to_thread(service.answer_active_rollcalls)
-        queried_at = batch_result.queried_at.strftime("%Y-%m-%d %H:%M:%S")
+        queried_at = _format_datetime(batch_result.queried_at)
         if not batch_result.rollcalls:
             return _format_no_rollcall_markdown(account, queried_at)
         return _format_answer_messages(batch_result)
+
+    async def _handle_cron(self, user_id: str, parts: Sequence[str]) -> ReplyPayload:
+        if len(parts) == 1:
+            schedules = await asyncio.to_thread(get_user_cron_schedules, user_id)
+            return _format_cron_status_messages(schedules)
+
+        action = parts[1].lower()
+        if len(parts) == 2 and action in {"off", "clear", "disable"}:
+            cleared_count = await asyncio.to_thread(clear_user_cron_schedules, user_id)
+            return _format_cron_cleared_markdown(cleared_count)
+
+        if len(parts) == 3 and action in {"del", "delete", "rm", "remove"}:
+            try:
+                cron_id = int(parts[2])
+            except ValueError:
+                return _format_error_markdown("参数错误", "任务 ID 必须是数字。")
+            schedule = await asyncio.to_thread(delete_user_cron_schedule, user_id, cron_id)
+            if not schedule:
+                schedules = await asyncio.to_thread(get_user_cron_schedules, user_id)
+                return [
+                    _format_error_markdown("删除失败", f"没有找到任务 ID {cron_id}。"),
+                    *_format_cron_status_messages(schedules),
+                ]
+            return _format_cron_deleted_markdown(schedule)
+
+        if len(parts) == 4 and action in {"add", "new", "set"}:
+            weekday_value = parts[2]
+            time_value = parts[3]
+        elif len(parts) == 3:
+            weekday_value = parts[1]
+            time_value = parts[2]
+        else:
+            return _format_error_markdown(
+                "参数错误",
+                "用法：/cron add 4 8:00、/cron del 2、/cron off",
+            )
+
+        account = await asyncio.to_thread(get_current_user_account, user_id)
+        if not account:
+            return _format_no_account_markdown()
+
+        try:
+            weekday = int(weekday_value)
+        except ValueError:
+            return _format_error_markdown("参数错误", "星期必须是 1-7，1=周一，4=周四。")
+
+        if not 1 <= weekday <= 7:
+            return _format_error_markdown("参数错误", "星期必须是 1-7，1=周一，4=周四。")
+
+        parsed_time = _parse_cron_time(time_value)
+        if not parsed_time:
+            return _format_error_markdown("参数错误", "时间格式请用 `8:00` 或 `08:00`。")
+
+        hour, minute = parsed_time
+        schedule, created = await asyncio.to_thread(add_user_cron_schedule, user_id, weekday, hour, minute)
+        return _format_cron_set_markdown(schedule, created)
 
     async def _handle_refresh(self, user_id: str) -> ReplyPayload:
         account = await asyncio.to_thread(get_current_user_account, user_id)
@@ -587,6 +898,75 @@ class XMUWeChatBotApp:
         service = RollcallService(account, session_cache_key=cache_key)
         removed = await asyncio.to_thread(service.clear_session_cache)
         return _format_refresh_markdown(account, removed)
+
+    async def _cron_loop(self) -> None:
+        while True:
+            try:
+                await self._run_due_crons()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[wechatbot] 定时任务异常：{exc}", file=sys.stderr, flush=True)
+            await asyncio.sleep(CRON_POLL_INTERVAL_SECONDS)
+
+    async def _run_due_crons(self) -> None:
+        now = _china_now()
+        jobs = await asyncio.to_thread(list_user_cron_jobs)
+        for job in jobs:
+            schedule = job.get("cron")
+            slot_key = _resolve_due_cron_slot(now, schedule)
+            if not slot_key:
+                continue
+            user_id = str(job.get("user_id") or "")
+            if not user_id:
+                continue
+            cron_id = int((schedule or {}).get("id", 0))
+            if cron_id <= 0:
+                continue
+            await asyncio.to_thread(mark_user_cron_triggered, user_id, cron_id, slot_key)
+            await self._execute_cron(user_id, schedule, now)
+
+    async def _execute_cron(self, user_id: str, schedule: dict, executed_at: datetime) -> None:
+        payload: ReplyPayload
+        async with self.command_lock:
+            account = await asyncio.to_thread(get_current_user_account, user_id)
+            if not account:
+                payload = [
+                    _format_cron_run_markdown(schedule, executed_at),
+                    _format_error_markdown("定时任务未执行", "当前没有可用账号。"),
+                ]
+            else:
+                try:
+                    cache_key = build_user_session_cache_key(user_id, int(account["id"]))
+                    service = RollcallService(account, session_cache_key=cache_key)
+                    batch_result = await asyncio.to_thread(service.answer_active_rollcalls)
+                    if not batch_result.rollcalls:
+                        payload = [
+                            _format_cron_run_markdown(schedule, batch_result.queried_at),
+                            _format_no_rollcall_markdown(
+                                account,
+                                _format_datetime(batch_result.queried_at),
+                            ),
+                        ]
+                    else:
+                        payload = [
+                            _format_cron_run_markdown(schedule, batch_result.queried_at),
+                            *_format_answer_messages(batch_result),
+                        ]
+                except Exception as exc:
+                    payload = [
+                        _format_cron_run_markdown(schedule, executed_at),
+                        _format_error_markdown("定时任务失败", str(exc)),
+                    ]
+
+            try:
+                await self._send_user_messages(user_id, payload)
+            except Exception as exc:
+                print(
+                    f"[wechatbot] 定时消息发送失败 user_id={user_id}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
 
 def _resolve_cred_path(cli_cred_path: Optional[str]) -> str:
@@ -632,8 +1012,12 @@ async def _run_bot(args: argparse.Namespace) -> None:
         print("[wechatbot] 已完成登录，按需启动 systemd 服务即可。", flush=True)
         return
 
+    await app.start_background_tasks()
     print("[wechatbot] 机器人已启动，等待微信命令消息。", flush=True)
-    await bot.start()
+    try:
+        await bot.start()
+    finally:
+        await app.stop_background_tasks()
 
 
 def build_parser() -> argparse.ArgumentParser:

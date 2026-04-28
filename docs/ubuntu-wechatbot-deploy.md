@@ -87,6 +87,7 @@ WantedBy=multi-user.target
 
 ```bash
 PYTHONUNBUFFERED=1
+TZ=Asia/Shanghai
 XMU_ROLLCALL_CONFIG_DIR=/你的数据目录
 XMU_WECHAT_BOT_CRED_PATH=/你的数据目录/wechatbot-credentials.json
 ```
@@ -113,6 +114,9 @@ sudo journalctl -u xmu-wechatbot -f
 
 - `/accounts`
 - `/switch 账号ID`
+- `/cron add 4 8:00`
+- `/cron del 2`
+- `/cron off`
 - `/refresh`
 - `/cancel`
 

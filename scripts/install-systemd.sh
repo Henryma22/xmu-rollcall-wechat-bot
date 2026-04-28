@@ -37,6 +37,7 @@ Wants=network-online.target
 Type=simple
 User=$SERVICE_USER
 WorkingDirectory=$APP_DIR
+Environment=TZ=Asia/Shanghai
 EnvironmentFile=$ENV_FILE
 ExecStart=$APP_DIR/.venv/bin/python -m xmu_rollcall.wechat_bot
 Restart=always

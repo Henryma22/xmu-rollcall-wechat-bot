@@ -6,6 +6,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import requests
 from xmulogin import xmulogin
@@ -26,6 +27,7 @@ DEFAULT_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9",
     "Referer": "https://ids.xmu.edu.cn/authserver/login",
 }
+CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass
@@ -219,7 +221,7 @@ class RollcallService:
         outcomes = [self.answer_rollcall(session, rollcall) for rollcall in rollcalls]
         return AnswerBatchResult(
             account=self.account,
-            queried_at=datetime.now(),
+            queried_at=datetime.now(CHINA_TZ),
             rollcalls=rollcalls,
             outcomes=outcomes,
         )

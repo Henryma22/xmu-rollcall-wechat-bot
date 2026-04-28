@@ -8,11 +8,12 @@
 - `/switch 账号ID`
 - `/accounts`
 - `/answer`
+- `/cron add 4 8:00`
 - `/refresh`
 - `/cancel`
 - `/help`
 
-`/answer` 不会持续轮询 TronClass，而是在你发命令时即时查一次；如果成功，会把签到码或经纬度发回微信。
+`/answer` 不会持续轮询 TronClass，而是在你发命令时即时查一次；如果成功，会把签到码或经纬度发回微信。机器人消息里的时间按中国时区 `UTC+8` 显示。
 
 ## 三步上手
 
@@ -61,6 +62,13 @@ sudo journalctl -u xmu-wechatbot -f
 
 - 发送 `/accounts` 看账号列表
 - 发送 `/switch 2` 切换到 `ID=2`
+
+定时执行：
+
+- 发送 `/cron add 4 8:00` 新增一条任务，也兼容简写 `/cron 4 8:00`
+- 发送 `/cron` 查看当前全部计划
+- 发送 `/cron del 2` 删除 `ID=2` 的任务
+- 发送 `/cron off` 清空全部定时
 
 ## 仓库里给你准备好的东西
 
