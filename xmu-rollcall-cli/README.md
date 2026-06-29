@@ -34,10 +34,25 @@ python -m xmu_rollcall.wechat_bot
 - `/switch 账号ID`
 - `/accounts`
 - `/answer`
+- `/watch 120`
+- `/watch status`
+- `/watch off`
 - `/cron add 4 8:00`
 - `/refresh`
 - `/cancel`
 - `/help`
+
+### `/watch` 定时提醒
+
+- `/watch 120`：每 120 秒轮询一次当前账号的活动签到。
+- `/watch status`：查看当前 watch 状态。
+- `/watch off`：停止 watch 轮询。
+
+`/watch` 的间隔单位是秒，最小值为 30 秒。它只检测活动签到并发送微信提醒，不会提交数字签到或雷达签到；需要完成签到时，仍由用户主动发送 `/answer`。
+
+### `/answer` 与 `/cron`
+
+`/answer` 会即时查询一次并按签到类型处理数字签到和雷达签到。`/cron` 是按星期和时间触发的定时 `/answer`，例如 `/cron add 4 8:00`。
 
 ## 更简单的方式
 

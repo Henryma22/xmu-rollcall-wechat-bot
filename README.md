@@ -23,12 +23,17 @@ Android 版用于在手机本地完成“后台轮询提醒 + 用户主动一键
 - `/switch 账号ID`
 - `/accounts`
 - `/answer`
+- `/watch 120`
+- `/watch status`
+- `/watch off`
 - `/cron add 4 8:00`
 - `/refresh`
 - `/cancel`
 - `/help`
 
 `/answer` 不会持续轮询 TronClass，而是在你发命令时即时查一次；如果成功，会把签到码或经纬度发回微信。机器人消息里的时间按中国时区 `UTC+8` 显示。
+
+`/watch` 是定时检测提醒模式。它会按秒级间隔轮询当前账号的活动签到，检测到新签到后给你发微信提醒，但不会提交数字签到或雷达签到；是否发送 `/answer` 完成签到由你决定。
 
 ## 三步上手
 
@@ -80,10 +85,15 @@ sudo journalctl -u xmu-wechatbot -f
 
 定时执行：
 
+- 发送 `/watch 120` 每 120 秒检查一次活动签到，只提醒不提交
+- 发送 `/watch status` 查看当前 watch 状态
+- 发送 `/watch off` 停止 watch 轮询
 - 发送 `/cron add 4 8:00` 新增一条任务，也兼容简写 `/cron 4 8:00`
 - 发送 `/cron` 查看当前全部计划
 - 发送 `/cron del 2` 删除 `ID=2` 的任务
 - 发送 `/cron off` 清空全部定时
+
+`/watch` 的间隔单位是秒，最小值为 30 秒。它和 `/cron` 不同：`/watch` 只负责发现签到并提醒；`/cron` 到点后会执行一次 `/answer` 风格的签到处理。
 
 ## 仓库里给你准备好的东西
 

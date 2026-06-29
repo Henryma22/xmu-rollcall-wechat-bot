@@ -114,11 +114,16 @@ sudo journalctl -u xmu-wechatbot -f
 
 - `/accounts`
 - `/switch 账号ID`
+- `/watch 120`
+- `/watch status`
+- `/watch off`
 - `/cron add 4 8:00`
 - `/cron del 2`
 - `/cron off`
 - `/refresh`
 - `/cancel`
+
+`/watch 120` 表示每 120 秒轮询一次活动签到。Watch 模式只发送微信提醒，不会提交签到；用户确认后可以手动发送 `/answer`，由机器人按数字签到或雷达签到类型执行一次提交。Watch 间隔单位为秒，最小值为 30 秒。
 
 ## 9. 机器人头像
 
