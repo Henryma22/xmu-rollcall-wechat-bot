@@ -1,0 +1,44 @@
+# Built variants and compilation outputs
+build/
+.gradle/
+.gradletasknamecache
+
+# Android Studio / IntelliJ IDEA configurations (local settings)
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/gradle.xml
+.idea/assetWizardSettings.xml
+.idea/dictionaries
+.idea/libraries
+.idea/caches
+.idea/nav/
+.idea/modules.xml
+.idea/deploymentTargetSelector.xml
+*.iml
+*.ipr
+*.iws
+
+# Local configuration file (contains path to local Android SDK)
+local.properties
+
+# Log files and crash dumps
+*.log
+captures/
+
+# Keystore files (for signing release builds)
+*.jks
+*.keystore
+
+# Built binaries (APKs, AARs, bundles)
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Heap dumps
+*.hprof
+

@@ -2,6 +2,7 @@ package com.xmu.rollcall.ui
 
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.widget.Toast
 import androidx.compose.animation.*
 import androidx.compose.foundation.background
@@ -39,11 +40,14 @@ import com.xmu.rollcall.service.WatchService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 // Premium Dark Theme Palette
 val DeepSlateBg = Color(0xFF0F172A)
 val CardBg = Color(0x1AFFFFFF)
-val CardBorder = Color(0x1FNDF3FF) // Subtle light border
+val CardBorder = Color(0x1FADF3FF) // Subtle light border
 val ElectricBlue = Color(0xFF3B82F6)
 val SoftCyan = Color(0xFF06B6D4)
 val SuccessGreen = Color(0xFF10B981)

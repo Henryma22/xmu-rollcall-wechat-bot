@@ -11,9 +11,9 @@
 
     <application
         android:allowBackup="true"
-        android:icon="@android:drawable/sym_def_app_icon"
-        android:label="XMU 签到助手"
-        android:roundIcon="@android:drawable/sym_def_app_icon"
+        android:icon="@drawable/app_icon"
+        android:label="XMU Rollcall Auto"
+        android:roundIcon="@drawable/app_icon"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
         android:usesCleartextTraffic="true">

@@ -37,7 +37,7 @@ class WatchService : Service() {
 
         val isRunning = MutableStateFlow(false)
         val logs = MutableStateFlow<List<String>>(emptyList())
-        val autoSubmit = MutableStateFlow(true)
+        val autoSubmit = MutableStateFlow(false)
         val pollIntervalMinutes = MutableStateFlow(5) // Default 5 mins
 
         fun addLog(message: String) {
@@ -248,7 +248,7 @@ class WatchService : Service() {
     }
 
     private fun createNotificationChannels() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES,O) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val watchChannel = NotificationChannel(
                 CHANNEL_ID,
                 "后台守护通知 (前台服务)",
