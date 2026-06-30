@@ -3,7 +3,6 @@ package com.xmu.rollcall.service
 import android.app.*
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
@@ -22,6 +21,7 @@ class WatchService : Service() {
     private var pollJob: Job? = null
 
     private lateinit var accountStore: AccountStore
+    private lateinit var settingsStore: WatchSettingsStore
     private var wakeLock: PowerManager.WakeLock? = null
 
     // Track processed rollcall IDs to avoid duplicate alerts/sign-ins
@@ -34,11 +34,37 @@ class WatchService : Service() {
         private const val NOTIFICATION_ID = 1001
         private const val CHANNEL_ID = "xmu_rollcall_watch_channel"
         private const val ALERT_CHANNEL_ID = "xmu_rollcall_alert_channel"
+        private const val MIN_INTERVAL_MINUTES = 1
+        private const val MAX_INTERVAL_MINUTES = 15
+        private const val WAKE_LOCK_TIMEOUT_MS = 20 * 60 * 1000L
 
         val isRunning = MutableStateFlow(false)
         val logs = MutableStateFlow<List<String>>(emptyList())
         val autoSubmit = MutableStateFlow(false)
         val pollIntervalMinutes = MutableStateFlow(5) // Default 5 mins
+
+        fun persistAutoSubmit(context: Context, enabled: Boolean) {
+            WatchSettingsStore(context.applicationContext).setAutoSubmit(enabled)
+            if (autoSubmit.value != enabled) {
+                addLog(if (enabled) "已开启检测后自动提交。" else "已关闭检测后自动提交。")
+            }
+            autoSubmit.value = enabled
+        }
+
+        fun persistPollInterval(context: Context, minutes: Int) {
+            val boundedMinutes = minutes.coerceIn(MIN_INTERVAL_MINUTES, MAX_INTERVAL_MINUTES)
+            WatchSettingsStore(context.applicationContext).setPollIntervalMinutes(boundedMinutes)
+            if (pollIntervalMinutes.value != boundedMinutes) {
+                addLog("轮询间隔已更新为 $boundedMinutes 分钟。")
+            }
+            pollIntervalMinutes.value = boundedMinutes
+        }
+
+        fun loadPersistedSettings(context: Context) {
+            val settingsStore = WatchSettingsStore(context.applicationContext)
+            autoSubmit.value = settingsStore.getAutoSubmit()
+            pollIntervalMinutes.value = settingsStore.getPollIntervalMinutes()
+        }
 
         fun addLog(message: String) {
             val sdf = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
@@ -56,27 +82,27 @@ class WatchService : Service() {
     override fun onCreate() {
         super.onCreate()
         accountStore = AccountStore.createEncrypted(this)
+        settingsStore = WatchSettingsStore(this)
+        autoSubmit.value = settingsStore.getAutoSubmit()
+        pollIntervalMinutes.value = settingsStore.getPollIntervalMinutes()
         createNotificationChannels()
-        
-        // Acquire wake lock to keep CPU running when screen is off
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "XmuRollcall::WatchWakeLock").apply {
-            acquire(10*60*1000L /*10 minutes*/)
-        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> startWatching()
             ACTION_STOP -> stopWatching()
+            else -> if (settingsStore.getWatchEnabled()) startWatching() else stopSelf()
         }
         return START_STICKY
     }
 
     private fun startWatching() {
         if (isRunning.value) return
+        settingsStore.setWatchEnabled(true)
         isRunning.value = true
         addLog("后台守护已开启，开始自动扫描...")
+        refreshWakeLock()
 
         // Promote to foreground service
         startForeground(NOTIFICATION_ID, createForegroundNotification("准备进行第一次扫描..."))
@@ -84,6 +110,7 @@ class WatchService : Service() {
         // Start background polling
         pollJob = serviceScope.launch {
             while (isActive) {
+                refreshWakeLock()
                 try {
                     performScan()
                 } catch (e: CancellationException) {
@@ -93,19 +120,24 @@ class WatchService : Service() {
                     e.printStackTrace()
                 }
                 
-                // Sleep for interval
-                val intervalMs = pollIntervalMinutes.value * 60 * 1000L
-                delay(intervalMs)
+                refreshWakeLock()
+                delayUntilNextScan()
             }
         }
     }
 
     private fun stopWatching() {
-        if (!isRunning.value) return
+        settingsStore.setWatchEnabled(false)
+        if (!isRunning.value) {
+            releaseWakeLock()
+            stopSelf()
+            return
+        }
         isRunning.value = false
         addLog("后台守护已关闭。")
         pollJob?.cancel()
         pollJob = null
+        releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -155,7 +187,7 @@ class WatchService : Service() {
             }
         }
 
-        val activeRollcalls = rollcalls.filter { !it.is_expired && it.rollcall_status != "on_call_fine" }
+        val activeRollcalls = rollcalls.filter { it.isActive }
         addLog("发现 ${activeRollcalls.size} 个活动签到 (总共 ${rollcalls.size} 个)。")
         updateNotificationText("扫描完成，活动签到: ${activeRollcalls.size} 个")
 
@@ -165,22 +197,14 @@ class WatchService : Service() {
                 continue
             }
 
-            // Mark as processed
-            processedRollcalls.add(rollcall.rollcall_id)
-
             if (autoSubmit.value) {
                 addLog("正在自动提交 [${rollcall.course_title}] 签到...")
                 try {
                     val outcome = withContext(Dispatchers.IO) {
-                        // Creating a fresh service invocation to ensure it has updated cookies
-                        val freshService = RollcallService(loginClient, activeAccount.username)
-                        if (rollcall.is_radar) {
-                            freshService.answerActiveRollcalls().outcomes.firstOrNull { it.rollcall.rollcall_id == rollcall.rollcall_id }
-                        } else {
-                            freshService.answerActiveRollcalls().outcomes.firstOrNull { it.rollcall.rollcall_id == rollcall.rollcall_id }
-                        }
+                        rollcallService.answerRollcall(rollcall)
                     }
-                    if (outcome != null && outcome.success) {
+                    if (outcome.success) {
+                        processedRollcalls.add(rollcall.rollcall_id)
                         val detail = when {
                             outcome.numberCode != null -> "签到码: ${outcome.numberCode}"
                             outcome.latitude != null && outcome.longitude != null -> String.format(Locale.US, "坐标: %.4f, %.4f", outcome.latitude, outcome.longitude)
@@ -189,7 +213,10 @@ class WatchService : Service() {
                         addLog("自动签到成功: [${rollcall.course_title}] ($detail)")
                         sendAlertNotification("自动签到成功", "[${rollcall.course_title}] 签到成功！$detail")
                     } else {
-                        val errMsg = outcome?.message ?: "原因未知"
+                        val errMsg = outcome.message
+                        if (outcome.action == "unsupported" || outcome.action == "skipped") {
+                            processedRollcalls.add(rollcall.rollcall_id)
+                        }
                         addLog("自动签到失败: [${rollcall.course_title}] ($errMsg)")
                         sendAlertNotification("自动签到失败", "[${rollcall.course_title}] 签到失败: $errMsg")
                     }
@@ -198,10 +225,50 @@ class WatchService : Service() {
                     sendAlertNotification("自动签到异常", "[${rollcall.course_title}] 提交出错: ${ansEx.message}")
                 }
             } else {
+                processedRollcalls.add(rollcall.rollcall_id)
                 addLog("检测到签到: [${rollcall.course_title}] (${rollcall.typeLabel})，请点击手动签到。")
                 sendAlertNotification("检测到新签到", "[${rollcall.course_title}] 请点击进入 App 签到。")
             }
         }
+    }
+
+    private suspend fun delayUntilNextScan() {
+        val intervalMinutes = pollIntervalMinutes.value.coerceIn(MIN_INTERVAL_MINUTES, MAX_INTERVAL_MINUTES)
+        val nextScanTime = System.currentTimeMillis() + intervalMinutes * 60 * 1000L
+        val sdf = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+        updateNotificationText("下次扫描: ${sdf.format(Date(nextScanTime))}")
+
+        var remainingMs = nextScanTime - System.currentTimeMillis()
+        while (remainingMs > 0 && serviceScope.isActive) {
+            delay(minOf(remainingMs, 15_000L))
+            val currentIntervalMinutes = pollIntervalMinutes.value.coerceIn(MIN_INTERVAL_MINUTES, MAX_INTERVAL_MINUTES)
+            val preferredNextScanTime = System.currentTimeMillis() + currentIntervalMinutes * 60 * 1000L
+            if (currentIntervalMinutes < intervalMinutes && preferredNextScanTime < nextScanTime) {
+                addLog("轮询间隔已缩短，将提前下次扫描。")
+                break
+            }
+            remainingMs = nextScanTime - System.currentTimeMillis()
+        }
+    }
+
+    private fun refreshWakeLock() {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val currentWakeLock = wakeLock ?: powerManager
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "XmuRollcall::WatchWakeLock")
+            .apply { setReferenceCounted(false) }
+            .also { wakeLock = it }
+
+        if (currentWakeLock.isHeld) {
+            currentWakeLock.release()
+        }
+        currentWakeLock.acquire(WAKE_LOCK_TIMEOUT_MS)
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let {
+            if (it.isHeld) it.release()
+        }
+        wakeLock = null
     }
 
     private fun createForegroundNotification(contentText: String): Notification {
@@ -248,42 +315,73 @@ class WatchService : Service() {
     }
 
     private fun createNotificationChannels() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val watchChannel = NotificationChannel(
-                CHANNEL_ID,
-                "后台守护通知 (前台服务)",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "保持后台服务常驻运行的常驻通知"
-            }
-
-            val alertChannel = NotificationChannel(
-                ALERT_CHANNEL_ID,
-                "签到状态提醒",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "签到成功、失败或检测到新签到时的警报提醒"
-                enableLights(true)
-                enableVibration(true)
-                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-            }
-
-            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            notificationManager.createNotificationChannel(watchChannel)
-            notificationManager.createNotificationChannel(alertChannel)
+        val watchChannel = NotificationChannel(
+            CHANNEL_ID,
+            "后台守护通知 (前台服务)",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "保持后台服务常驻运行的常驻通知"
         }
+
+        val alertChannel = NotificationChannel(
+            ALERT_CHANNEL_ID,
+            "签到状态提醒",
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "签到成功、失败或检测到新签到时的警报提醒"
+            enableLights(true)
+            enableVibration(true)
+            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+        }
+
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.createNotificationChannel(watchChannel)
+        notificationManager.createNotificationChannel(alertChannel)
     }
 
     override fun onDestroy() {
         super.onDestroy()
         serviceJob.cancel()
-        wakeLock?.let {
-            if (it.isHeld) it.release()
-        }
+        releaseWakeLock()
         isRunning.value = false
     }
 
     override fun onBind(intent: Intent?): IBinder? {
         return null
+    }
+}
+
+class WatchSettingsStore(context: Context) {
+    private val preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+
+    fun getWatchEnabled(): Boolean {
+        return preferences.getBoolean(KEY_WATCH_ENABLED, false)
+    }
+
+    fun setWatchEnabled(enabled: Boolean) {
+        preferences.edit().putBoolean(KEY_WATCH_ENABLED, enabled).apply()
+    }
+
+    fun getAutoSubmit(): Boolean {
+        return preferences.getBoolean(KEY_AUTO_SUBMIT, false)
+    }
+
+    fun setAutoSubmit(enabled: Boolean) {
+        preferences.edit().putBoolean(KEY_AUTO_SUBMIT, enabled).apply()
+    }
+
+    fun getPollIntervalMinutes(): Int {
+        return preferences.getInt(KEY_POLL_INTERVAL_MINUTES, 5).coerceIn(1, 15)
+    }
+
+    fun setPollIntervalMinutes(minutes: Int) {
+        preferences.edit().putInt(KEY_POLL_INTERVAL_MINUTES, minutes.coerceIn(1, 15)).apply()
+    }
+
+    companion object {
+        const val PREFERENCES_NAME = "xmu_rollcall_watch_settings"
+        const val KEY_WATCH_ENABLED = "watch_enabled"
+        const val KEY_AUTO_SUBMIT = "auto_submit"
+        const val KEY_POLL_INTERVAL_MINUTES = "poll_interval_minutes"
     }
 }
